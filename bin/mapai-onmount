@@ -1,0 +1,83 @@
+#!/bin/bash
+# mapai-onmount — fires when a volume mounts; opens LifeOS if it was the vault.
+#
+# Wired to a LaunchAgent with StartOnMount, which launchd triggers on EVERY
+# mount — USB sticks, disk images, network shares. So the first job here is to
+# decide this is not our business and exit quietly, which is the common case.
+#
+# Installed by: mapai-onmount --install
+# Removed by:   mapai-onmount --uninstall
+set -uo pipefail
+
+VAULT="/Volumes/MapAi"
+STAMP="$HOME/.mapai/.last-open"
+LOG="$HOME/.mapai/onmount.log"
+PLIST="$HOME/Library/LaunchAgents/ca.map.mapai.onmount.plist"
+LABEL="ca.map.mapai.onmount"
+DEBOUNCE=20   # seconds; launchd can fire several times for one mount
+
+case "${1:-}" in
+  --install)
+    mkdir -p "$HOME/Library/LaunchAgents" "$HOME/.mapai"
+    cat > "$PLIST" <<PLISTEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key>
+  <array><string>$HOME/LifeOS/bin/mapai-onmount</string></array>
+  <key>StartOnMount</key><true/>
+  <!-- Belt and braces. StartOnMount is the primary trigger, but it fires only
+       on an actual mount event: if the vault is ALREADY attached, a double-click
+       prompts for the password and then does nothing at all. Watching /Volumes
+       catches mounts that StartOnMount misses, and the script is cheap to run
+       and exits immediately when it is not our business. -->
+  <key>WatchPaths</key>
+  <array><string>/Volumes</string></array>
+  <key>RunAtLoad</key><false/>
+  <!-- Without this launchd kills the job's entire process group the moment the
+       script exits, which takes the web server down with it. The launcher's
+       whole purpose is to leave long-running children behind. -->
+  <key>AbandonProcessGroup</key><true/>
+  <key>StandardOutPath</key><string>$LOG</string>
+  <key>StandardErrorPath</key><string>$LOG</string>
+</dict>
+</plist>
+PLISTEOF
+    launchctl bootout "gui/$UID/$LABEL" 2>/dev/null
+    launchctl bootstrap "gui/$UID" "$PLIST" 2>/dev/null \
+      || launchctl load "$PLIST" 2>/dev/null
+    echo "✓ installed — unlocking MapAi now opens LifeOS in Safari"
+    echo "  plist: $PLIST"
+    exit 0 ;;
+  --uninstall)
+    launchctl bootout "gui/$UID/$LABEL" 2>/dev/null || launchctl unload "$PLIST" 2>/dev/null
+    rm -f "$PLIST"
+    echo "✓ removed — unlocking the vault no longer opens anything"
+    exit 0 ;;
+  --status)
+    launchctl list | grep -q "$LABEL" && echo "loaded" || echo "not loaded"
+    exit 0 ;;
+esac
+
+# ---- the actual trigger --------------------------------------------------
+mkdir -p "$HOME/.mapai"
+
+# Not the vault? Not our business.
+mount | grep -q " on $VAULT " || exit 0
+
+# launchd fires StartOnMount more than once for a single mount. Debounce so
+# Safari does not get three windows.
+now=$(date +%s)
+if [ -f "$STAMP" ]; then
+  last=$(cat "$STAMP" 2>/dev/null || echo 0)
+  [ $((now - last)) -lt $DEBOUNCE ] && exit 0
+fi
+echo "$now" > "$STAMP"
+
+echo "$(date '+%Y-%m-%d %H:%M:%S') vault mounted — starting LifeOS" >> "$LOG"
+# NOT ~/Desktop/M.command — TCC blocks a LaunchAgent from executing
+# anything on the Desktop ("Operation not permitted").
+exec "$HOME/LifeOS/bin/mapai-front" >> "$LOG" 2>&1

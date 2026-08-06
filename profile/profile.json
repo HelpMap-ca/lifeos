@@ -1,0 +1,19 @@
+{
+  "profile_schema": 2,
+  "public": true,
+  "draft": true,
+  "name": "",
+  "handle": "",
+  "pronouns": "",
+  "city": "",
+  "bio": "",
+  "pillars": [],
+  "tags": [],
+  "avatar": "",
+  "intro_video": "",
+  "member_since": "",
+  "links": [],
+  "contact": { "email": "", "phone": "" },
+  "business": { "name": "", "line": "" },
+  "tabs": ["profile", "business", "pins", "contact"]
+}

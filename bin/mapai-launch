@@ -1,0 +1,28 @@
+#!/bin/bash
+# mapai-launch — what the MapAi Desktop app runs.
+#
+# Kept here rather than inside the .app because ~/Desktop is TCC-protected and
+# hand-built bundles there are awkward; the app is a thin osacompile wrapper
+# that calls this.
+#
+#   locked   → macOS's own password dialog, then LifeOS in Safari
+#   unlocked → LifeOS in Safari straight away  (the case a bare double-click
+#              on the .sparsebundle cannot handle, because no mount event fires)
+IMG="$HOME/Desktop/MapAi.sparsebundle"
+VAULT="/Volumes/MapAi"
+STAMP="$HOME/.mapai/.last-open"
+mkdir -p "$HOME/.mapai"
+
+if [ ! -d "$VAULT" ]; then
+  # Claim the debounce stamp before mounting so the mount-triggered LaunchAgent
+  # stands down and we don't race it into launching two copies of everything.
+  date +%s > "$STAMP"
+  open "$IMG"
+  for i in $(seq 1 120); do [ -d "$VAULT" ] && break; sleep 1; done
+  if [ ! -d "$VAULT" ]; then
+    osascript -e 'display notification "Vault was not unlocked." with title "MapAi"' 2>/dev/null
+    exit 1
+  fi
+fi
+date +%s > "$STAMP"
+exec "$HOME/LifeOS/bin/mapai-front"

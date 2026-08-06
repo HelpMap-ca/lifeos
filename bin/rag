@@ -1,0 +1,8 @@
+#!/bin/bash
+# rag — wrapper so the tool is `rag index` / `rag ask "…"` from any shell,
+# matching how `mapai`, `mapsec` and `synology` are invoked.
+#
+# Unlike mapsec this does NOT need the vault: the index lives in ~/LifeOS and
+# the spine is readable while the vault is locked. A locked vault only means
+# the HTML deliverables tier is skipped, which `rag index` reports honestly.
+exec python3 "$HOME/LifeOS/bin/rag.py" "$@"

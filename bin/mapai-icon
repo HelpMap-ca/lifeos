@@ -1,0 +1,106 @@
+#!/bin/bash
+# mapai-icon — set the Finder icon of the MapAi vault (or any folder/bundle).
+#
+#   mapai-icon <image.png|jpg|icns> [target]
+#   mapai-icon --reset [target]
+#
+# target defaults to ~/Desktop/MapAi.sparsebundle.
+#
+# How a custom folder icon actually works on macOS, since it is not obvious:
+# the icon lives in the RESOURCE FORK of a file literally named "Icon\r"
+# (Icon followed by a carriage return) inside the folder, and the folder itself
+# carries a kHasCustomIcon attribute. Rez writes the fork, SetFile sets the
+# attributes. The Icon\r file is then marked invisible so it never shows up.
+#
+# Finder aggressively caches icons, so this touches the folder afterwards to
+# nudge it. If an icon still looks stale, log out and back in.
+set -euo pipefail
+
+TARGET_DEFAULT="$HOME/Desktop/MapAi.sparsebundle"
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+usage() { sed -n '2,12p' "$0"; exit 1; }
+[ $# -lt 1 ] && usage
+
+if [ "$1" = "--reset" ]; then
+  TARGET="${2:-$TARGET_DEFAULT}"
+  rm -f "$TARGET/Icon"$'\r' 2>/dev/null || true
+  SetFile -a c "$TARGET" 2>/dev/null || true
+  touch "$TARGET"
+  echo "✓ custom icon removed from $TARGET"
+  exit 0
+fi
+
+SRC="$1"
+TARGET="${2:-$TARGET_DEFAULT}"
+
+[ -e "$SRC" ]    || { echo "mapai-icon: no such image: $SRC" >&2; exit 2; }
+[ -e "$TARGET" ] || { echo "mapai-icon: no such target: $TARGET" >&2; exit 2; }
+
+# ---- 1. produce an .icns -------------------------------------------------
+if [ "${SRC##*.}" = "icns" ]; then
+  ICNS="$SRC"
+else
+  # Must be square, or macOS letterboxes it. Pad to a square canvas first if
+  # the source is not already 1:1, rather than distorting the artwork.
+  W=$(sips -g pixelWidth  "$SRC" | awk '/pixelWidth/{print $2}')
+  H=$(sips -g pixelHeight "$SRC" | awk '/pixelHeight/{print $2}')
+  SQ="$WORK/square.png"
+  if [ "$W" != "$H" ]; then
+    MAX=$(( W > H ? W : H ))
+    sips -s format png "$SRC" --padToHeightWidth "$MAX" "$MAX" --padColor FFFFFF \
+         --out "$SQ" >/dev/null
+    echo "  source was ${W}x${H}; padded to ${MAX}x${MAX} rather than stretching it"
+  else
+    sips -s format png "$SRC" --out "$SQ" >/dev/null
+  fi
+
+  SET="$WORK/icon.iconset"; mkdir -p "$SET"
+  for s in 16 32 128 256 512; do
+    sips -z "$s" "$s"           "$SQ" --out "$SET/icon_${s}x${s}.png"    >/dev/null
+    sips -z $((s*2)) $((s*2))   "$SQ" --out "$SET/icon_${s}x${s}@2x.png" >/dev/null
+  done
+  ICNS="$WORK/icon.icns"
+  iconutil -c icns "$SET" -o "$ICNS"
+fi
+
+# ---- 2. attach it to the target -----------------------------------------
+ICONFILE="$TARGET/Icon"$'\r'
+if [ -d "$TARGET" ]; then
+  rm -f "$ICONFILE" 2>/dev/null || true
+  # Rez needs the icns as a resource of type 'icns' with id -16455.
+  #
+  # Two quirks, both found the hard way:
+  #  · The resource syntax contains single quotes, so it cannot be built with a
+  #    single-quoted bash string — hence the heredoc.
+  #  · Rez fails with a bogus "noErr (0) during open" on long absolute paths.
+  #    It is an ancient tool. Run it from a scratch directory against short
+  #    relative names and it behaves.
+  cp "$ICNS" "$WORK/i.icns"
+  cat > "$WORK/icon.r" <<'EOF'
+read 'icns' (-16455) "i.icns";
+EOF
+  ( cd "$WORK" && Rez -o out.rsrc icon.r ) \
+    || { echo "mapai-icon: Rez failed to build the icon resource" >&2; exit 3; }
+  cp "$WORK/out.rsrc" "$ICONFILE"
+  SetFile -a C "$TARGET"     # folder has a custom icon
+  SetFile -a V "$ICONFILE"   # and the carrier file stays invisible
+else
+  # A plain file carries its icon in its own resource fork.
+  cp "$ICNS" "$WORK/i.icns"
+  cat > "$WORK/icon.r" <<'EOF'
+read 'icns' (-16455) "i.icns";
+EOF
+  ( cd "$WORK" && Rez -a -o "$TARGET" icon.r ) 2>/dev/null || true
+  SetFile -a C "$TARGET"
+fi
+
+touch "$TARGET"
+# Keep a copy so the LifeOS Vault panel can show what is currently applied.
+mkdir -p "$HOME/.mapai"
+cp "$ICNS" "$HOME/.mapai/vault-icon.icns" 2>/dev/null || true
+sips -s format png -z 256 256 "$ICNS" --out "$HOME/.mapai/vault-icon.png" >/dev/null 2>&1 || true
+
+echo "✓ icon applied to $(basename "$TARGET")"
+echo "  Finder caches icons — if it looks stale, close and reopen the Desktop window."

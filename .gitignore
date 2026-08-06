@@ -1,0 +1,11 @@
+vault/
+inbox/
+backups/
+state/
+__pycache__/
+*.pyc
+comms/
+node_modules/
+.venv/
+*.db
+*.log

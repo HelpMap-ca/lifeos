@@ -1,0 +1,266 @@
+#!/usr/bin/env python3
+"""mapsec — machine-readable secret access for map.ca, backed by the macOS Keychain.
+
+The companion to the LifeOS Vault. The vault is passphrase-gated for YOUR eyes;
+this is the half a machine can use — local LLMs, cron, the e-transfer watcher —
+because the Keychain is unlocked by your login session, not by a prompt you have
+to answer every time.
+
+  mapsec set NAME        store/replace a value (Keychain prompts; never echoed,
+                         never in argv, never in shell history)
+  mapsec get NAME        print the value to stdout — for scripts
+  mapsec list            every tracked secret: stored?, rotation status. NO values.
+  mapsec manifest        full metadata as JSON. NO values. Give this to an LLM.
+  mapsec due             only what is overdue or due within 14 days
+  mapsec mark NAME       record that you rotated it today
+  mapsec rm NAME         delete the value from the Keychain (metadata survives)
+  mapsec env NAME...     emit KEY=value lines for the named secrets (careful:
+                         this puts plaintext on stdout — pipe it, do not print it)
+
+Design notes, deliberately:
+  · Values NEVER pass through this process's argv. `set` hands the terminal to
+    /usr/bin/security, which reads the value with echo off.
+  · The manifest holds no secret material, so it is safe to hand an agent whole.
+    Almost every question ("where does this live? how do I rotate it?") is
+    answerable from metadata alone — reserve `get` for when a value is truly needed.
+  · Rotation dates live in ~/.mapsec/rotations.json — plaintext, no secrets.
+"""
+import json
+import os
+import subprocess
+import sys
+from datetime import date, datetime, timedelta
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+MANIFEST = os.path.join(HERE, "secrets-manifest.json")
+STATE_DIR = os.path.expanduser("~/.mapsec")
+ROTATIONS = os.path.join(STATE_DIR, "rotations.json")
+ACCT = "mapsec"
+
+BOLD, DIM, RED, YEL, GRN, RST = "\033[1m", "\033[2m", "\033[31m", "\033[33m", "\033[32m", "\033[0m"
+
+
+def svc(name):
+    return "mapsec." + name
+
+
+def load_manifest():
+    try:
+        with open(MANIFEST) as fh:
+            return json.load(fh)["secrets"]
+    except FileNotFoundError:
+        die("manifest not found: %s" % MANIFEST)
+    except (KeyError, ValueError) as exc:
+        die("manifest is malformed (%s)" % exc)
+
+
+def load_rotations():
+    try:
+        with open(ROTATIONS) as fh:
+            return json.load(fh)
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def save_rotation(name, when=None):
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    rot = load_rotations()
+    rot[name] = when or date.today().isoformat()
+    with open(ROTATIONS, "w") as fh:
+        json.dump(rot, fh, indent=2, sort_keys=True)
+    os.chmod(ROTATIONS, 0o600)
+
+
+def die(msg, code=1):
+    print("mapsec: " + msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def find(name, secrets):
+    for s in secrets:
+        if s["k"] == name:
+            return s
+    return None
+
+
+def stored(name):
+    """True if the Keychain holds a value. Never returns the value itself."""
+    r = subprocess.run(["security", "find-generic-password", "-a", ACCT, "-s", svc(name)],
+                       capture_output=True)
+    return r.returncode == 0
+
+
+def rot_state(s, rotations):
+    """(label, colour, days_until_due). days is None when there is no cadence."""
+    last = rotations.get(s["k"]) or s.get("last")
+    if not s.get("cadence"):
+        return ("on-demand", DIM, None, last)
+    if not last:
+        return ("never rotated", RED, -9999, None)
+    try:
+        due = datetime.strptime(last, "%Y-%m-%d").date() + timedelta(days=s["cadence"])
+    except ValueError:
+        return ("bad date %r" % last, RED, -9999, last)
+    days = (due - date.today()).days
+    if days < 0:
+        return ("overdue %dd" % -days, RED, days, last)
+    if days <= 14:
+        return ("due in %dd" % days, YEL, days, last)
+    return ("in %dd" % days, GRN, days, last)
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_set(args):
+    if len(args) != 1:
+        die("usage: mapsec set NAME")
+    name = args[0]
+    secrets = load_manifest()
+    s = find(name, secrets)
+    if s is None:
+        print("%s%s is not in the manifest.%s Storing it anyway, but add it to" % (YEL, name, RST))
+        print("  %s" % MANIFEST)
+        print("so future-you knows where it lives and when it rotates.\n")
+    elif s.get("get"):
+        print("%sWhere to get it:%s %s\n" % (DIM, RST, s["get"]))
+    # /usr/bin/security prompts for the value itself with echo off — the value
+    # never enters this process, its argv, or the shell's history.
+    rc = subprocess.call(["security", "add-generic-password", "-U",
+                          "-a", ACCT, "-s", svc(name),
+                          "-D", "map.ca secret", "-l", svc(name), "-w"])
+    if rc != 0:
+        die("Keychain refused the write (exit %d)" % rc, rc)
+    save_rotation(name)
+    print("%s✓%s %s stored in the Keychain · rotation clock reset to today" % (GRN, RST, name))
+    if s and s.get("set"):
+        print("\n%sStill to do — put it where it is actually used:%s\n  %s"
+              % (BOLD, RST, s["set"].replace("\n", "\n  ")))
+
+
+def cmd_get(args):
+    if len(args) != 1:
+        die("usage: mapsec get NAME")
+    r = subprocess.run(["security", "find-generic-password", "-a", ACCT,
+                        "-s", svc(args[0]), "-w"], capture_output=True, text=True)
+    if r.returncode != 0:
+        die("no value stored for %s (try: mapsec set %s)" % (args[0], args[0]), 2)
+    sys.stdout.write(r.stdout.rstrip("\n"))
+    if sys.stdout.isatty():
+        sys.stdout.write("\n")
+
+
+def cmd_env(args):
+    if not args:
+        die("usage: mapsec env NAME [NAME...]")
+    for name in args:
+        r = subprocess.run(["security", "find-generic-password", "-a", ACCT,
+                            "-s", svc(name), "-w"], capture_output=True, text=True)
+        if r.returncode != 0:
+            print("# %s: not stored" % name)
+            continue
+        print("%s=%s" % (name, r.stdout.rstrip("\n")))
+
+
+def cmd_list(args):
+    secrets = load_manifest()
+    rotations = load_rotations()
+    tier_of = lambda s: {1: 0, 2: 1}.get(s.get("tier"), 2)
+    rows = sorted(secrets, key=lambda s: (tier_of(s), s["k"]))
+    have = 0
+    print("%-32s %-6s %-9s %-16s %s" % ("SECRET", "TIER", "STORED", "ROTATION", "WHERE"))
+    for s in rows:
+        has = stored(s["k"])
+        have += has
+        label, colour, _, _ = rot_state(s, rotations)
+        tier = {1: "T1", 2: "T2"}.get(s.get("tier"), "local")
+        print("%-32s %-6s %s%-9s%s %s%-16s%s %s"
+              % (s["k"], tier,
+                 GRN if has else DIM, "yes" if has else "—", RST,
+                 colour, label, RST,
+                 (s.get("store") or "")[:44]))
+    print("\n%d of %d have a value in the Keychain. Metadata: %s"
+          % (have, len(rows), MANIFEST))
+
+
+def cmd_due(args):
+    secrets = load_manifest()
+    rotations = load_rotations()
+    items = []
+    for s in secrets:
+        label, colour, days, last = rot_state(s, rotations)
+        if days is not None and days <= 14:
+            items.append((days, s, label, colour, last))
+    if not items:
+        print("%s✓%s nothing due within 14 days." % (GRN, RST))
+        return
+    items.sort(key=lambda t: t[0])
+    print("%s:\n" % ("1 secret needs attention" if len(items) == 1
+                     else "%d secrets need attention" % len(items)))
+    for days, s, label, colour, last in items:
+        print("%s%s%s  %s%s%s" % (BOLD, s["k"], RST, colour, label, RST))
+        print("   lives in : %s" % s.get("store", "?"))
+        print("   last     : %s" % (last or "never"))
+        if s.get("get"):
+            print("   retrieve : %s" % s["get"])
+        if s.get("set"):
+            print("   set      : %s" % s["set"].replace("\n", "\n              "))
+        if s.get("note"):
+            print("   %snote%s     : %s" % (YEL, RST, s["note"]))
+        print()
+
+
+def cmd_manifest(args):
+    secrets = load_manifest()
+    rotations = load_rotations()
+    out = []
+    for s in secrets:
+        label, _, days, last = rot_state(s, rotations)
+        e = dict(s)
+        e["value_stored"] = stored(s["k"])
+        e["last_rotated"] = last
+        e["rotation_status"] = label
+        e["days_until_due"] = days
+        out.append(e)
+    print(json.dumps({
+        "_comment": "Metadata only — contains NO secret values. Use 'mapsec get NAME' "
+                    "for a value, and only when one is actually required.",
+        "generated": date.today().isoformat(),
+        "secrets": out,
+    }, indent=2))
+
+
+def cmd_mark(args):
+    if len(args) != 1:
+        die("usage: mapsec mark NAME")
+    save_rotation(args[0])
+    print("%s✓%s %s marked rotated %s" % (GRN, RST, args[0], date.today().isoformat()))
+
+
+def cmd_rm(args):
+    if len(args) != 1:
+        die("usage: mapsec rm NAME")
+    name = args[0]
+    r = subprocess.run(["security", "delete-generic-password", "-a", ACCT, "-s", svc(name)],
+                       capture_output=True)
+    if r.returncode != 0:
+        die("no value stored for %s" % name, 2)
+    print("%s✓%s value for %s deleted from the Keychain (metadata kept)" % (GRN, RST, name))
+
+
+CMDS = {"set": cmd_set, "get": cmd_get, "list": cmd_list, "ls": cmd_list,
+        "manifest": cmd_manifest, "due": cmd_due, "mark": cmd_mark,
+        "rm": cmd_rm, "env": cmd_env}
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return
+    cmd = CMDS.get(sys.argv[1])
+    if not cmd:
+        die("unknown command %r — try: %s" % (sys.argv[1], ", ".join(sorted(CMDS))))
+    cmd(sys.argv[2:])
+
+
+if __name__ == "__main__":
+    main()

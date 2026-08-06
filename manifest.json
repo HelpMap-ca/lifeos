@@ -1,0 +1,9 @@
+{
+  "lifeos": "0.3.3",
+  "channel": "company-dev",
+  "source": "And Can Did Inc.",
+  "prepared": "2026-08-04",
+  "prepared_for": "Robert Loterh",
+  "layout": ["app", "profile", "vault", "tools", "models", "inbox", "backups", "state", "bin"],
+  "note": "Clean development copy. No personal data, no credentials. See SETUP.md to get running, UPDATE-PROTOCOL.md before sending changes back."
+}

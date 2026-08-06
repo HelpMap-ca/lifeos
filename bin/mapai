@@ -1,0 +1,545 @@
+#!/usr/bin/env python3
+"""mapai — one entry point for the vault, the NAS, and the corpus.
+
+The shape of the thing:
+
+    MapAi (Desktop, locked)         ← what you double-click; 1234
+      └── /Volumes/MapAi            ← mounts here when unlocked
+            ├── lifeos.html         ← the FRONT END
+            ├── Storage/            ← the NAS, mounted
+            └── Spine/              ← ~/LifeOS, the data spine
+
+    Synology (backend)              ← where the bytes actually live
+    DGX Spark  (compute)            ← reads the same corpus over the tailnet
+
+  mapai status          everything at a glance — vault, NAS, DGX, corpus
+  mapai open            unlock the vault without a prompt (agents use this)
+  mapai lock            eject it
+  mapai front           launch the LifeOS front end in the browser
+  mapai net             network topology + what can currently reach what
+  mapai sweep           push the corpus to the NAS and re-index it
+  mapai index           rebuild the prompt index only (no upload)
+  mapai corpus [QUERY]  search the index — the thing prompts are grounded in
+
+Why `open` can skip the password: the vault password lives in the Keychain,
+which your login session unlocks. Finder still asks a human for 1234; a machine
+asks the Keychain. Same two-store split as mapsec — a passphrase-gated store
+cannot, by definition, serve an unattended process.
+"""
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+
+HOME = os.path.expanduser("~")
+VAULT_IMG = os.path.join(HOME, "Desktop", "MapAi.sparsebundle")
+VAULT_MP = "/Volumes/MapAi"
+SPINE = os.path.join(HOME, "LifeOS")
+BIN = os.path.join(SPINE, "bin")
+SYNOLOGY = os.path.join(BIN, "synology")
+INDEX_DIR = os.path.join(SPINE, "models")
+INDEX = os.path.join(INDEX_DIR, "corpus-index.json")
+DGX = os.environ.get("LIFEOS_DGX_HOST", "")
+
+BOLD, DIM, RED, YEL, GRN, CYN, RST = (
+    "\033[1m", "\033[2m", "\033[31m", "\033[33m", "\033[32m", "\033[36m", "\033[0m")
+
+# What gets swept up, in two tiers.
+#
+# core  — small, high-signal, text-shaped. This is what prompts are grounded in,
+#         so it must sweep in seconds, not hours. Runs by default.
+# media — the December trip footage: 190 files, ~80 GB of drone and camera video.
+#         Exactly what a NAS is for and exactly what should not live on a laptop
+#         SSD, but it is not promptable and it must not hold up the core sweep.
+#         Runs only on: mapai sweep --media
+CORPUS = [
+    # The WHOLE spine, mirrored 1:1 — vault, profile, bin, tools, models,
+    # inbox, backups, manifest, README. Not a curated subset: the point is that
+    # /LifeOS on the NAS and ~/LifeOS on this Mac are the same tree, so the NAS
+    # copy is a complete, runnable LifeOS. That is what makes it something you
+    # can hand to someone else.
+    {"tier": "core", "local": SPINE, "remote": "LifeOS",
+     "label": "LifeOS spine (whole tree)",
+     # models/rag.db is the ONE exception to "mirror everything". It is a
+     # derived artefact — rebuild it in 42 s with `rag index` — and it embeds
+     # the full text of the vault, the chats and the private memory notes into
+     # a single portable file. This tree is meant to be handed to other people;
+     # a searchable copy of the owner's private archive must not ride along in it.
+     "exclude": ["models/rag.db"]},
+    {"tier": "core", "local": os.path.join(HOME, "Documents"),
+     "remote": "MapAi/Documents", "label": "Documents"},
+    {"tier": "core", "local": os.path.join(HOME, "Desktop"),
+     "remote": "MapAi/Desktop", "label": "Desktop",
+     "exclude": ["trip/", "MapAi.sparsebundle"]},
+    {"tier": "media", "local": os.path.join(HOME, "Desktop", "trip"),
+     "remote": "Media/trip", "label": "trip footage (~80 GB)"},
+]
+
+# Extensions worth indexing as text a model can actually read.
+TEXTUAL = {".md", ".txt", ".json", ".csv", ".html", ".htm", ".py", ".js", ".mjs",
+           ".ts", ".tsx", ".sh", ".yaml", ".yml", ".toml", ".sql", ".env", ".ini"}
+SKIP_DIRS = {".git", "node_modules", ".Spotlight-V100", ".fseventsd", ".Trashes",
+             "__pycache__", ".venv", "venv", ".DS_Store", "MapAi.sparsebundle"}
+
+
+def die(msg, code=1):
+    print("mapai: " + msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def sh(cmd, **kw):
+    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
+
+def human(n):
+    for u in ("B", "K", "M", "G", "T"):
+        if n < 1024:
+            return "%d%s" % (n, u)
+        n /= 1024.0
+    return "%.1fP" % n
+
+
+def keychain(name):
+    r = sh(["security", "find-generic-password", "-a", "mapsec", "-s", "mapsec." + name, "-w"])
+    return r.stdout.rstrip("\n") if r.returncode == 0 else None
+
+
+# ------------------------------------------------------------------ vault
+
+def vault_mounted():
+    return os.path.ismount(VAULT_MP)
+
+
+def cmd_open(args):
+    if vault_mounted():
+        print("%s✓%s vault already open at %s" % (DIM, RST, VAULT_MP))
+        return
+    if not os.path.exists(VAULT_IMG):
+        die("no vault at %s" % VAULT_IMG, 2)
+    pw = keychain("MAPAI_VAULT_PASSWORD")
+    if not pw:
+        die("MAPAI_VAULT_PASSWORD is not in the Keychain, so I cannot open the\n"
+            "  vault unattended. Either double-click MapAi on the Desktop and type\n"
+            "  the password, or store it:  mapsec set MAPAI_VAULT_PASSWORD", 3)
+    p = subprocess.run(["hdiutil", "attach", "-stdinpass", "-quiet", VAULT_IMG],
+                       input=pw, text=True, capture_output=True)
+    if p.returncode != 0:
+        die("could not open the vault: %s" % (p.stderr.strip() or p.stdout.strip()), 5)
+    print("%s✓%s vault open at %s" % (GRN, RST, VAULT_MP))
+
+
+def cmd_lock(args):
+    if not vault_mounted():
+        print("%s✓%s vault is already locked" % (DIM, RST))
+        return
+    r = sh(["hdiutil", "detach", VAULT_MP])
+    if r.returncode != 0:
+        r = sh(["hdiutil", "detach", "-force", VAULT_MP])
+    if r.returncode != 0:
+        die("could not lock: %s" % r.stderr.strip(), 5)
+    print("%s✓%s vault locked — contents are encrypted at rest again" % (GRN, RST))
+
+
+def cmd_front(args):
+    """Serve the LifeOS front end over localhost (Ollama refuses file://)."""
+    cmd_open([])
+    launcher = os.path.join(HOME, "Desktop", "M.command")
+    if os.path.exists(launcher):
+        subprocess.Popen(["/bin/bash", launcher],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print("%s✓%s LifeOS starting — http://localhost:8765/lifeos.html" % (GRN, RST))
+    else:
+        die("launcher not found at %s" % launcher, 2)
+
+
+# ------------------------------------------------------------------ network
+
+def reachable(host, port, timeout=2):
+    import socket
+    try:
+        with socket.create_connection((host, int(port)), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def tailscale_bin():
+    for p in ("/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+              "/usr/local/bin/tailscale", "/opt/homebrew/bin/tailscale"):
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def nas_host():
+    return keychain("SYNOLOGY_HOST") or "synology.local"
+
+
+def cmd_net(args):
+    print("%sNetwork%s\n" % (BOLD, RST))
+    nas = nas_host()
+    print("  This Mac  → NAS  (%s:5000)  %s" % (nas, ok(reachable(nas, 5000))))
+    print("  This Mac  → DGX  (%s:22)    %s" % (DGX, ok(reachable(DGX, 22))))
+
+    r = sh(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=6", "mapai@" + DGX,
+            "timeout 3 bash -c '</dev/tcp/%s/5000' 2>/dev/null && echo YES || echo NO" % nas])
+    dgx_nas = "YES" in r.stdout
+    print("  DGX       → NAS  (%s:5000)  %s" % (nas, ok(dgx_nas)))
+
+    ts = tailscale_bin()
+    print("\n%sTailnet%s" % (BOLD, RST))
+    if not ts:
+        print("  Tailscale is not installed on this Mac.")
+    else:
+        s = sh([ts, "status"])
+        out = (s.stdout + s.stderr).strip()
+        if "stopped" in out.lower() or "Logged out" in out:
+            print("  %sthis Mac : stopped / logged out%s" % (YEL, RST))
+            print("  %sstart it with:  open -a Tailscale%s" % (DIM, RST))
+        else:
+            for line in out.splitlines()[:8]:
+                print("  " + line)
+
+    if not dgx_nas:
+        print("\n  %sThe DGX still cannot reach the NAS.%s Both sit behind different"
+              % (YEL, RST))
+        print("  gateways (a double-NAT LAN), and the")
+        print("  NAT only passes traffic outward. Tailscale is what closes this.")
+
+
+def ok(b):
+    return "%sok%s" % (GRN, RST) if b else "%sblocked%s" % (RED, RST)
+
+
+# ------------------------------------------------------------------ corpus
+
+def walk(root, exclude=()):
+    ex = tuple(e.rstrip("/") for e in exclude)
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames
+                       if d not in SKIP_DIRS
+                       and not d.endswith(".sparsebundle")
+                       and os.path.relpath(os.path.join(dirpath, d), root) not in ex]
+        for fn in filenames:
+            if fn == ".DS_Store" or fn.startswith("._"):
+                continue
+            full = os.path.join(dirpath, fn)
+            # Exclusions have to cover FILES too, not just directories — the
+            # rag index is a single file, and listing it here would put a
+            # private artefact back into the shared corpus manifest.
+            if os.path.relpath(full, root) in ex:
+                continue
+            yield full
+
+
+def classify(path):
+    ext = os.path.splitext(path)[1].lower()
+    if ext in {".md", ".txt"}:
+        return "note"
+    if ext in {".html", ".htm"}:
+        return "deliverable"
+    if ext in {".py", ".js", ".mjs", ".ts", ".tsx", ".sh"}:
+        return "code"
+    if ext in {".json", ".csv", ".yaml", ".yml", ".toml"}:
+        return "data"
+    if ext in {".png", ".jpg", ".jpeg", ".heic", ".gif", ".webp"}:
+        return "image"
+    if ext in {".pdf", ".docx", ".pages", ".key", ".numbers"}:
+        return "document"
+    if ext in {".mp3", ".wav", ".m4a", ".aiff"}:
+        return "audio"
+    if ext in {".mp4", ".mov", ".m4v"}:
+        return "video"
+    return "other"
+
+
+def head(path, n=400):
+    """First n characters — enough for a model to know what a file is."""
+    try:
+        with open(path, "r", errors="ignore") as fh:
+            t = fh.read(4000)
+    except OSError:
+        return ""
+    t = re.sub(r"<script.*?</script>|<style.*?</style>", " ", t, flags=re.S | re.I)
+    t = re.sub(r"<[^>]+>", " ", t)
+    return re.sub(r"\s+", " ", t).strip()[:n]
+
+
+def cmd_index(args):
+    print("%sIndexing%s" % (BOLD, RST))
+    entries, totals = [], {}
+    for src in CORPUS:
+        root = src["local"]
+        if not os.path.isdir(root):
+            print("  %s— %-28s missing, skipped%s" % (DIM, src["label"], RST))
+            continue
+        n, size = 0, 0
+        for p in walk(root, src.get("exclude", ())):
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            ext = os.path.splitext(p)[1].lower()
+            e = {
+                "path": p,
+                "rel": os.path.relpath(p, root),
+                "source": src["label"],
+                "tier": src["tier"],
+                "remote": os.path.join(src["remote"], os.path.relpath(p, root)),
+                "kind": classify(p),
+                "size": st.st_size,
+                "mtime": datetime.fromtimestamp(st.st_mtime, timezone.utc)
+                          .isoformat(timespec="seconds"),
+            }
+            # Do not preview the index's own output — it would embed a copy of
+            # the corpus inside the corpus and grow on every run.
+            generated = os.path.basename(p) in ("corpus-index.json", "CORPUS.md",
+                                                "rag.db")
+            if ext in TEXTUAL and st.st_size < 2_000_000 and not generated:
+                e["preview"] = head(p)
+            entries.append(e)
+            n += 1
+            size += st.st_size
+        totals[src["label"]] = (n, size)
+        print("  %s✓%s %-28s %5d files  %8s" % (GRN, RST, src["label"], n, human(size)))
+
+    os.makedirs(INDEX_DIR, exist_ok=True)
+    doc = {
+        "generated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "machine": os.uname().nodename,
+        "nas": nas_host(),
+        "sources": [{"label": s["label"], "local": s["local"], "remote": s["remote"]}
+                    for s in CORPUS],
+        "counts": {k: {"files": v[0], "bytes": v[1]} for k, v in totals.items()},
+        "files": entries,
+    }
+    with open(INDEX, "w") as fh:
+        json.dump(doc, fh, indent=1)
+
+    # A markdown companion, because a local model reads this far better than JSON.
+    md = os.path.join(INDEX_DIR, "CORPUS.md")
+    by_kind = {}
+    for e in entries:
+        by_kind.setdefault(e["kind"], []).append(e)
+    with open(md, "w") as fh:
+        fh.write("# Corpus index\n\nGenerated %s · %d files · %s · NAS %s\n\n"
+                 % (doc["generated"], len(entries),
+                    human(sum(e["size"] for e in entries)), doc["nas"]))
+        for kind in sorted(by_kind, key=lambda k: -len(by_kind[k])):
+            items = by_kind[kind]
+            fh.write("## %s (%d)\n\n" % (kind, len(items)))
+            for e in sorted(items, key=lambda e: e["mtime"], reverse=True)[:200]:
+                fh.write("- `%s` · %s · %s\n" % (e["rel"], human(e["size"]), e["mtime"][:10]))
+                if e.get("preview"):
+                    fh.write("  > %s\n" % e["preview"][:220])
+            fh.write("\n")
+
+    print("\n  %d files indexed → %s" % (len(entries), INDEX))
+    print("  readable digest  → %s" % md)
+
+
+def load_index():
+    try:
+        with open(INDEX) as fh:
+            return json.load(fh)
+    except (FileNotFoundError, ValueError):
+        die("no index yet — run: mapai index", 2)
+
+
+def cmd_corpus(args):
+    doc = load_index()
+    if not args:
+        print("%sCorpus%s  indexed %s\n" % (BOLD, RST, doc["generated"]))
+        for label, c in doc["counts"].items():
+            print("  %-30s %5d files  %8s" % (label, c["files"], human(c["bytes"])))
+        kinds = {}
+        for e in doc["files"]:
+            kinds[e["kind"]] = kinds.get(e["kind"], 0) + 1
+        print("\n  " + "  ".join("%s:%d" % (k, v) for k, v in
+                                 sorted(kinds.items(), key=lambda t: -t[1])))
+        print("\n  search it:  mapai corpus <query>")
+        return
+    query = " ".join(args)
+
+    # Semantic first. The keyword index is filenames plus a short preview, so
+    # it can only find what you can already name — and the media tier is
+    # nothing BUT filenames. rag.py answers by meaning over the text tiers;
+    # keyword still runs underneath it, and is the whole answer for video.
+    if semantic_corpus(query):
+        print()
+
+    q = query.lower()
+    hits = [e for e in doc["files"]
+            if q in e["rel"].lower() or q in (e.get("preview", "").lower())]
+    hits.sort(key=lambda e: e["mtime"], reverse=True)
+    print("%s%d filename/preview hits for %r%s\n" % (BOLD, len(hits), q, RST))
+    for e in hits[:40]:
+        print("%s%s%s" % (BOLD, e["rel"], RST))
+        print("  %s · %s · %s · %s" % (e["source"], e["kind"], human(e["size"]), e["mtime"][:10]))
+        if e.get("preview"):
+            print("  %s%s%s" % (DIM, e["preview"][:160], RST))
+
+
+def semantic_corpus(query, k=5):
+    """Top passages from the RAG index. Silent no-op if it isn't built yet."""
+    rag_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rag.py")
+    if not os.path.exists(rag_py):
+        return False
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("rag", rag_py)
+        rag = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(rag)
+        if not os.path.exists(rag.DB):
+            return False
+        hits = rag.search(rag.connect(), query, k)
+    except Exception as exc:
+        print("%s(semantic search unavailable: %s)%s" % (DIM, exc, RST))
+        return False
+    if not hits:
+        return False
+    print("%sBy meaning%s  %s(rag: %d passages)%s\n" % (BOLD, RST, DIM, len(hits), RST))
+    for score, rel, source, _path, ordn, text in hits:
+        snippet = " ".join(text.split())[:170]
+        print("  %s%.3f  %s%s %s[%s]%s" % (BOLD, score, rel, RST, DIM, source, RST))
+        print("     %s%s%s" % (DIM, snippet, RST))
+    return True
+
+
+def cmd_sweep(args):
+    """Push the corpus to the NAS, then re-index. The whole point."""
+    media = "--media" in args
+    tiers = {"core", "media"} if media else {"core"}
+    nas = nas_host()
+    if not reachable(nas, 5000):
+        die("the NAS at %s is not answering — check it is on and on the LAN" % nas, 4)
+    if not keychain("SYNOLOGY_AGENT_PASSWORD"):
+        die("no agent credentials yet. Run the provisioning step first:\n"
+            "    %s provision" % SYNOLOGY, 3)
+    print("%sSweeping to %s%s  (%s)\n"
+          % (BOLD, nas, RST, "core + media" if media else "core only"))
+    done, failed = [], []
+    for src in CORPUS:
+        if src["tier"] not in tiers:
+            print("  %s— %-28s skipped (mapai sweep --media)%s" % (DIM, src["label"], RST))
+            continue
+        if not os.path.isdir(src["local"]):
+            print("  %s— %s missing, skipped%s" % (DIM, src["label"], RST))
+            continue
+        print("  %s%s%s" % (CYN, src["label"], RST))
+        cmd = [sys.executable, SYNOLOGY, "sync", src["local"], src["remote"]]
+        for e in src.get("exclude", ()):
+            cmd += ["--exclude", e]
+        r = subprocess.run(cmd)
+        if r.returncode != 0:
+            print("    %sfailed (exit %d)%s" % (RED, r.returncode, RST))
+            failed.append(src["label"])
+        else:
+            done.append(src["label"])
+    print()
+    cmd_index([])
+
+    # The index always succeeds — it only reads local disk. Never let that be
+    # mistaken for the upload having worked; report on the transfers themselves.
+    print()
+    if failed and not done:
+        print("%s✗ NOTHING reached the NAS.%s All %d transfers failed."
+              % (RED, RST, len(failed)))
+        print("  The index below describes local files only. Nothing is on %s." % nas)
+        sys.exit(1)
+    if failed:
+        print("%s⚠ Partial sweep.%s %d of %d reached the NAS; these did not: %s"
+              % (YEL, RST, len(done), len(done) + len(failed), ", ".join(failed)))
+        sys.exit(1)
+    print("%s✓ swept and indexed.%s %d sources on the NAS and promptable."
+          % (GRN, RST, len(done)))
+    if not media:
+        print("  %s~80 GB of trip footage is still local only — push it with:"
+              "  mapai sweep --media%s" % (DIM, RST))
+
+
+# ------------------------------------------------------------------ status
+
+def cmd_status(args):
+    print("%s%sMapAi%s\n" % (BOLD, CYN, RST))
+
+    # Vault
+    if vault_mounted():
+        st = os.statvfs(VAULT_MP)
+        used = (st.f_blocks - st.f_bfree) * st.f_frsize
+        n = sum(1 for _ in walk(VAULT_MP))
+        print("  %sVault%s      %sopen%s at %s · %d files · %s"
+              % (BOLD, RST, GRN, RST, VAULT_MP, n, human(used)))
+    elif os.path.exists(VAULT_IMG):
+        sz = sum(os.path.getsize(os.path.join(dp, f))
+                 for dp, _, fs in os.walk(VAULT_IMG) for f in fs)
+        print("  %sVault%s      %slocked%s · %s on disk · AES-256"
+              % (BOLD, RST, YEL, RST, human(sz)))
+    else:
+        print("  %sVault%s      %snot created%s" % (BOLD, RST, RED, RST))
+
+    # NAS
+    nas = nas_host()
+    up = reachable(nas, 5000)
+    print("  %sNAS%s        %s · %s" % (BOLD, RST, nas, ok(up)))
+    if up:
+        agent = keychain("SYNOLOGY_AGENT_PASSWORD")
+        admin = keychain("SYNOLOGY_ADMIN_PASSWORD")
+        print("             agent account %s · admin credential %s"
+              % ("%sready%s" % (GRN, RST) if agent else "%snot set%s" % (YEL, RST),
+                 "%spresent%s" % (GRN, RST) if admin else "%snot set%s" % (DIM, RST)))
+        mounts = [l.split(" on ")[1].split(" (")[0]
+                  for l in sh(["mount"]).stdout.splitlines() if "smbfs" in l]
+        print("             mounted: %s" % (", ".join(mounts) if mounts else "none"))
+
+    # DGX
+    dgx_up = reachable(DGX, 22)
+    print("  %sDGX%s        %s · %s" % (BOLD, RST, DGX, ok(dgx_up)))
+
+    # Corpus
+    try:
+        with open(INDEX) as fh:
+            doc = json.load(fh)
+        tot = sum(c["files"] for c in doc["counts"].values())
+        byt = sum(c["bytes"] for c in doc["counts"].values())
+        age = time.time() - os.path.getmtime(INDEX)
+        print("  %sCorpus%s     %d files · %s · indexed %s ago"
+              % (BOLD, RST, tot, human(byt), fmt_age(age)))
+    except (FileNotFoundError, ValueError):
+        print("  %sCorpus%s     %snot indexed yet%s — run: mapai index" % (BOLD, RST, YEL, RST))
+
+    print()
+
+
+def fmt_age(sec):
+    if sec < 3600:
+        return "%dm" % (sec // 60)
+    if sec < 86400:
+        return "%dh" % (sec // 3600)
+    return "%dd" % (sec // 86400)
+
+
+CMDS = {"status": cmd_status, "open": cmd_open, "unlock": cmd_open,
+        "lock": cmd_lock, "close": cmd_lock, "front": cmd_front,
+        "net": cmd_net, "sweep": cmd_sweep, "index": cmd_index,
+        "corpus": cmd_corpus}
+
+
+def main():
+    if len(sys.argv) < 2:
+        return cmd_status([])
+    if sys.argv[1] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return
+    cmd = CMDS.get(sys.argv[1])
+    if not cmd:
+        die("unknown command %r — try: %s" % (sys.argv[1], ", ".join(sorted(CMDS))))
+    cmd(sys.argv[2:])
+
+
+if __name__ == "__main__":
+    main()

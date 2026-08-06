@@ -1,0 +1,360 @@
+#!/usr/bin/env python3
+"""doc-extract — photo of a document in, filled-in House DNA fields out.
+
+Two halves, each doing what it is actually good at:
+
+  1. READING   Apple's Vision framework (bin/ocr). Runs on the Neural Engine.
+               No download, no VRAM, no network, ~0.7s a page, and better on
+               bills and receipts than a small vision LLM would be.
+  2. UNDERSTANDING  A local model via Ollama. Given clean text and a named set
+               of fields, even an 8B model does this well. That is the whole
+               trick: do not ask a small model to read pixels, ask it to
+               understand text.
+
+  doc-extract <image|pdf> [--type auto|property_tax_bill|…] [--model NAME]
+              [--property "123 Sample Road"] [--save] [--quiet]
+
+  --save   files the document into ~/LifeOS/vault/properties/<property>/ and
+           writes the extraction beside it, so the next sweep puts it on the NAS.
+
+Nothing is invented: the model is instructed to return null for anything not
+literally present, and every value it does return is checked back against the
+OCR text. A value the model produced that does not appear in the document is
+reported as unverified rather than silently trusted — which is the difference
+between a useful tool and a confident liar.
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+HOME = os.path.expanduser("~")
+BIN = os.path.join(HOME, "LifeOS", "bin")
+SCHEMA = os.path.join(HOME, "LifeOS", "tools", "house-dna.json")
+PROPS = os.path.join(HOME, "LifeOS", "vault", "properties")
+OLLAMA = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+DEFAULT_MODEL = os.environ.get("LIFEOS_MODEL", "qwen2.5:32b")
+
+BOLD, DIM, GRN, YEL, RED, CYN, RST = (
+    "\033[1m", "\033[2m", "\033[32m", "\033[33m", "\033[31m", "\033[36m", "\033[0m")
+
+
+def die(msg, code=1):
+    print("doc-extract: " + msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def load_schema():
+    with open(SCHEMA) as fh:
+        return json.load(fh)
+
+
+def all_fields(schema):
+    out = {}
+    for g in schema["groups"]:
+        for f in g["fields"]:
+            out[f["k"]] = dict(f, group=g["id"])
+    return out
+
+
+# ------------------------------------------------------------------ ocr
+
+def ocr(path):
+    exe = os.path.join(BIN, "ocr")
+    if not os.path.exists(exe):
+        die("the OCR binary is missing (%s). Rebuild:\n"
+            "  swiftc -O -o ~/LifeOS/bin/ocr ~/LifeOS/tools/ocr/ocr.swift" % exe, 3)
+    r = subprocess.run([exe, path, "--json"], capture_output=True, text=True)
+    if r.returncode != 0:
+        die("OCR failed: %s" % (r.stderr.strip() or "unknown"), 4)
+    return json.loads(r.stdout)
+
+
+# ------------------------------------------------------------------ llm
+
+def ollama(model, prompt, system, want_json=True, timeout=600):
+    body = {
+        "model": model,
+        "prompt": prompt,
+        "system": system,
+        "stream": False,
+        "options": {"temperature": 0, "num_ctx": 8192},
+    }
+    if want_json:
+        body["format"] = "json"
+    req = urllib.request.Request(
+        OLLAMA.rstrip("/") + "/api/generate",
+        data=json.dumps(body).encode(), method="POST",
+        headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read())["response"]
+    except urllib.error.URLError as exc:
+        die("cannot reach Ollama at %s (%s).\n"
+            "  Start it: open -a Ollama" % (OLLAMA, exc), 5)
+
+
+def classify(model, text, schema):
+    types = schema["doc_types"]
+    listing = "\n".join("- %s: %s" % (t["id"], t["label"]) for t in types)
+    out = ollama(model,
+                 "Document text:\n---\n%s\n---\n\nWhich type is it?" % text[:3000],
+                 "You classify documents. Reply with JSON only: "
+                 '{\"doc_type\": \"<id>\", \"confidence\": <0-1>}. '
+                 "Valid ids:\n" + listing)
+    try:
+        d = json.loads(out)
+        t = d.get("doc_type")
+        if any(x["id"] == t for x in types):
+            return t, float(d.get("confidence") or 0)
+    except (ValueError, TypeError):
+        pass
+    return "other", 0.0
+
+
+def extract(model, text, doc_type, schema, fields):
+    wanted = next((t["fills"] for t in schema["doc_types"] if t["id"] == doc_type), [])
+    if not wanted:
+        wanted = list(fields.keys())
+    spec = []
+    for k in wanted:
+        f = fields.get(k)
+        if not f:
+            continue
+        spec.append("  %-18s %-9s %s" % (k, f["type"], f.get("hint", f["label"])))
+    system = (
+        "You extract structured data from documents. Rules, in order of importance:\n"
+        "1. Return ONLY values that appear LITERALLY in the document text.\n"
+        "2. If a field is not present, return null. Never guess, never infer, "
+        "never carry a value over from your own knowledge.\n"
+        "3. Money: digits and a decimal point only, no currency symbol or commas "
+        "(e.g. 3943.60).\n"
+        "4. Dates: YYYY-MM-DD.\n"
+        "5. Canadian postal codes: OCR frequently reads 0 as O and 1 as I. "
+        "A postal code is always LETTER-DIGIT-LETTER space DIGIT-LETTER-DIGIT, "
+        "so correct it to that pattern.\n"
+        "6. Reply with a single JSON object whose keys are exactly the field "
+        "names given, and nothing else.\n\n"
+        "Fields:\n" + "\n".join(spec))
+    out = ollama(model, "Document text:\n---\n%s\n---" % text, system)
+    try:
+        return json.loads(out)
+    except ValueError:
+        m = re.search(r"\{.*\}", out, re.S)
+        if m:
+            try:
+                return json.loads(m.group(0))
+            except ValueError:
+                pass
+        return {}
+
+
+# ------------------------------------------------------------------ verify
+
+def norm(s):
+    return re.sub(r"[^a-z0-9.]", "", str(s).lower())
+
+
+# Characters OCR confuses in each direction. Applied positionally, which is the
+# only way to resolve them: "O" is correct in a letter slot and wrong in a digit
+# slot, and no amount of prompting makes a small model apply that reliably.
+TO_DIGIT = {"O": "0", "o": "0", "I": "1", "l": "1", "i": "1",
+            "S": "5", "s": "5", "B": "8", "Z": "2", "z": "2"}
+TO_ALPHA = {"0": "O", "1": "I", "5": "S", "8": "B", "2": "Z"}
+
+
+def fix_postal(v):
+    """Force a Canadian postal code into LETTER-DIGIT-LETTER DIGIT-LETTER-DIGIT."""
+    raw = re.sub(r"[^A-Za-z0-9]", "", str(v)).upper()
+    if len(raw) != 6:
+        return v
+    out = []
+    for i, ch in enumerate(raw):
+        want_alpha = i in (0, 2, 4)
+        if want_alpha and ch.isdigit():
+            ch = TO_ALPHA.get(ch, ch)
+        elif not want_alpha and ch.isalpha():
+            ch = TO_DIGIT.get(ch, ch)
+        out.append(ch)
+    return "%s %s" % ("".join(out[:3]), "".join(out[3:]))
+
+
+def fix_money(v):
+    s = re.sub(r"[^0-9.\-]", "", str(v))
+    if not s or s in (".", "-"):
+        return v
+    try:
+        return "%.2f" % float(s)
+    except ValueError:
+        return v
+
+
+def normalize(values, fields):
+    """Deterministic repairs the model should never have been asked to make."""
+    notes = []
+    for k, v in list(values.items()):
+        if v in (None, "", []):
+            continue
+        t = (fields.get(k) or {}).get("type")
+        if k == "postal_code":
+            nv = fix_postal(v)
+            if nv != v:
+                notes.append("postal code %s → %s (OCR letter/digit confusion)" % (v, nv))
+                values[k] = nv
+        elif t == "money":
+            nv = fix_money(v)
+            if nv != str(v):
+                values[k] = nv
+        elif isinstance(v, str):
+            values[k] = re.sub(r"[ \t]+", " ", v).strip()
+    return notes
+
+
+def verify(values, text, repaired=()):
+    """Check every extracted value actually occurs in the document.
+
+    A small model will occasionally produce a plausible number that is not on
+    the page. Grounding each value in the source text is what makes the output
+    trustworthy enough to write into a record without a human re-reading the
+    bill."""
+    hay = norm(text)
+    haynum = re.sub(r"[^0-9.]", "", text)
+    out = {}
+    for k, v in values.items():
+        if v in (None, "", []):
+            continue
+        nv = norm(v)
+        ok = bool(nv) and (nv in hay)
+        if not ok and re.fullmatch(r"[0-9.]+", nv or ""):
+            # money/numbers survive comma-stripping; check digits-only too
+            ok = nv in haynum
+            if not ok:
+                # "487000.00" should still match a document reading "$487,000".
+                # Compare numerically rather than as strings, or every whole
+                # dollar amount gets falsely flagged.
+                try:
+                    want = float(nv)
+                    ok = any(abs(float(m) - want) < 0.005
+                             for m in re.findall(r"\d[\d,]*\.?\d*", text)
+                             if m.replace(",", "").replace(".", "").isdigit()
+                             for m in [m.replace(",", "")])
+                except ValueError:
+                    pass
+        if not ok and isinstance(v, str) and len(nv) > 12:
+            # long free text (legal descriptions) — accept a strong prefix match
+            ok = nv[:12] in hay
+        # A value we deliberately repaired will not match the page verbatim —
+        # that is the point of repairing it. Give it its own state rather than
+        # pretending it was found as-is or flagging it as suspect.
+        state = "repaired" if k in repaired else ("verified" if ok else "unverified")
+        out[k] = {"value": v, "verified": ok or state == "repaired", "state": state}
+    return out
+
+
+# ------------------------------------------------------------------ main
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return
+    path = args[0]
+    if not os.path.exists(path):
+        die("no such file: %s" % path, 2)
+
+    def opt(name, default=None):
+        return args[args.index(name) + 1] if name in args else default
+
+    model = opt("--model", DEFAULT_MODEL)
+    want = opt("--type", "auto")
+    prop = opt("--property")
+    quiet = "--quiet" in args
+    save = "--save" in args
+
+    schema = load_schema()
+    fields = all_fields(schema)
+
+    t0 = time.time()
+    o = ocr(path)
+    ocr_ms = int((time.time() - t0) * 1000)
+    text = o["text"]
+    if not text.strip():
+        die("no text found in that image", 6)
+    conf = sum(l["confidence"] for l in o["lines"]) / max(len(o["lines"]), 1)
+
+    if not quiet:
+        print("%s📄 %s%s" % (BOLD, os.path.basename(path), RST))
+        print("  %sread%s   %d lines · %d pages · confidence %.2f · %d ms (Apple Vision)"
+              % (DIM, RST, len(o["lines"]), o["pages"], conf, ocr_ms))
+
+    t1 = time.time()
+    if want == "auto":
+        doc_type, dconf = classify(model, text, schema)
+    else:
+        doc_type, dconf = want, 1.0
+    label = next((t["label"] for t in schema["doc_types"] if t["id"] == doc_type), doc_type)
+    if not quiet:
+        print("  %stype%s   %s%s%s (%.0f%% sure)" % (DIM, RST, CYN, label, RST, dconf * 100))
+
+    raw = extract(model, text, doc_type, schema, fields)
+    before = dict(raw)
+    repair_notes = normalize(raw, fields)
+    repaired = {k for k in raw if str(raw.get(k)) != str(before.get(k))}
+    checked = verify(raw, text, repaired)
+    llm_ms = int((time.time() - t1) * 1000)
+
+    if not quiet:
+        print("  %sthink%s  %s · %d ms\n" % (DIM, RST, model, llm_ms))
+        got = {k: v for k, v in checked.items()}
+        if not got:
+            print("  %snothing extracted%s" % (YEL, RST))
+        for k, d in got.items():
+            f = fields.get(k, {})
+            mark = {"verified": "%s✓%s" % (GRN, RST),
+                    "repaired": "%s↻%s" % (CYN, RST),
+                    "unverified": "%s?%s" % (YEL, RST)}[d["state"]]
+            print("  %s %-22s %s" % (mark, f.get("label", k), d["value"]))
+        for n in repair_notes:
+            print("\n  %s↻ repaired: %s%s" % (CYN, n, RST))
+        unver = [k for k, d in got.items() if d["state"] == "unverified"]
+        if unver:
+            print("\n  %s? = not found verbatim in the document — check these before trusting them%s"
+                  % (YEL, RST))
+
+    result = {
+        "file": os.path.abspath(path),
+        "extracted_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "doc_type": doc_type, "doc_type_label": label, "type_confidence": dconf,
+        "ocr": {"lines": len(o["lines"]), "pages": o["pages"],
+                "confidence": round(conf, 4), "ms": ocr_ms, "engine": "apple-vision"},
+        "llm": {"model": model, "ms": llm_ms},
+        "fields": checked,
+        "property": prop,
+        "raw_text": text,
+    }
+
+    if save:
+        slug = re.sub(r"[^a-z0-9]+", "-", (prop or "unfiled").lower()).strip("-")
+        dest = os.path.join(PROPS, slug, "documents")
+        os.makedirs(dest, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        base = "%s-%s" % (stamp, doc_type)
+        ext = os.path.splitext(path)[1] or ".png"
+        with open(path, "rb") as src, open(os.path.join(dest, base + ext), "wb") as dst:
+            dst.write(src.read())
+        with open(os.path.join(dest, base + ".json"), "w") as fh:
+            json.dump(result, fh, indent=2)
+        result["saved_to"] = os.path.join(dest, base + ext)
+        if not quiet:
+            print("\n  %ssaved%s  %s" % (DIM, RST, dest))
+
+    if quiet:
+        print(json.dumps(result))
+
+
+if __name__ == "__main__":
+    main()

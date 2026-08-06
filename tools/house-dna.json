@@ -1,0 +1,90 @@
+{
+  "_comment": "House DNA — the structured profile of a property. One shared schema so the extractor, the LifeOS UI, and any local agent all agree on what a property is. Fields are deliberately flat and plainly named: a small local model fills these far more reliably than it fills a nested structure.",
+  "_version": 1,
+  "_updated": "2026-07-31",
+
+  "groups": [
+    {
+      "id": "identity",
+      "label": "Identity",
+      "icon": "📍",
+      "fields": [
+        {"k": "address",          "label": "Address",            "type": "text"},
+        {"k": "municipality",     "label": "Municipality",       "type": "text"},
+        {"k": "county",           "label": "County / Region",    "type": "text"},
+        {"k": "postal_code",      "label": "Postal code",        "type": "text", "hint": "A1A 1A1 — OCR often reads 0 as O"},
+        {"k": "roll_number",      "label": "Assessment roll no.", "type": "text", "hint": "Ontario: 19 digits, often shown in groups"},
+        {"k": "pin",              "label": "PIN / Parcel ID",    "type": "text"},
+        {"k": "legal_description","label": "Legal description",  "type": "textarea"},
+        {"k": "lot_size",         "label": "Lot size",           "type": "text"},
+        {"k": "year_built",       "label": "Year built",         "type": "number"},
+        {"k": "property_class",   "label": "Assessment class",   "type": "text", "hint": "Residential, Farmland (FT), Commercial…"}
+      ]
+    },
+    {
+      "id": "structure",
+      "label": "Structure",
+      "icon": "🏗️",
+      "fields": [
+        {"k": "living_area",   "label": "Living area (sq ft)", "type": "number"},
+        {"k": "bedrooms",      "label": "Bedrooms",            "type": "number"},
+        {"k": "bathrooms",     "label": "Bathrooms",           "type": "number"},
+        {"k": "storeys",       "label": "Storeys",             "type": "number"},
+        {"k": "foundation",    "label": "Foundation",          "type": "text"},
+        {"k": "exterior",      "label": "Exterior / siding",   "type": "text"},
+        {"k": "roof_material", "label": "Roof material",       "type": "text"},
+        {"k": "roof_year",     "label": "Roof installed",      "type": "number"},
+        {"k": "outbuildings",  "label": "Outbuildings",        "type": "textarea"}
+      ]
+    },
+    {
+      "id": "systems",
+      "label": "Systems",
+      "icon": "⚙️",
+      "fields": [
+        {"k": "heating_type",   "label": "Heating",          "type": "text"},
+        {"k": "heating_fuel",   "label": "Fuel",             "type": "text"},
+        {"k": "heating_year",   "label": "Installed",        "type": "number"},
+        {"k": "cooling",        "label": "Cooling",          "type": "text"},
+        {"k": "water_source",   "label": "Water source",     "type": "text", "hint": "Municipal, drilled well, cistern…"},
+        {"k": "septic",         "label": "Waste water",      "type": "text", "hint": "Municipal sewer, septic tank + bed…"},
+        {"k": "septic_pumped",  "label": "Septic last pumped","type": "date"},
+        {"k": "electrical",     "label": "Electrical panel", "type": "text", "hint": "e.g. 200A breaker"},
+        {"k": "internet",       "label": "Internet",         "type": "text"}
+      ]
+    },
+    {
+      "id": "financial",
+      "label": "Financial",
+      "icon": "💵",
+      "fields": [
+        {"k": "assessed_value",   "label": "Assessed value",     "type": "money"},
+        {"k": "assessment_year",  "label": "Assessment year",    "type": "number"},
+        {"k": "annual_tax",       "label": "Annual property tax","type": "money"},
+        {"k": "tax_year",         "label": "Tax year",           "type": "number"},
+        {"k": "tax_instalments",  "label": "Instalments",        "type": "textarea", "hint": "date + amount, one per line"},
+        {"k": "insurer",          "label": "Insurer",            "type": "text"},
+        {"k": "policy_number",    "label": "Policy number",      "type": "text"},
+        {"k": "policy_renewal",   "label": "Policy renews",      "type": "date"},
+        {"k": "mortgage_lender",  "label": "Mortgage lender",    "type": "text"},
+        {"k": "mortgage_renewal", "label": "Mortgage renews",    "type": "date"}
+      ]
+    }
+  ],
+
+  "doc_types": [
+    {"id": "property_tax_bill", "label": "Property tax bill",
+     "fills": ["roll_number","address","municipality","county","assessed_value","annual_tax","tax_year","tax_instalments","property_class","postal_code"]},
+    {"id": "assessment_notice", "label": "Assessment notice (MPAC)",
+     "fills": ["roll_number","address","assessed_value","assessment_year","property_class","legal_description","lot_size"]},
+    {"id": "insurance_policy",  "label": "Insurance policy",
+     "fills": ["insurer","policy_number","policy_renewal","address","living_area","year_built"]},
+    {"id": "utility_bill",      "label": "Utility bill",
+     "fills": ["address","heating_fuel","municipality"]},
+    {"id": "contractor_invoice","label": "Contractor invoice / receipt",
+     "fills": ["roof_material","roof_year","heating_type","heating_year","septic_pumped"]},
+    {"id": "deed_survey",       "label": "Deed / survey",
+     "fills": ["legal_description","pin","lot_size","address"]},
+    {"id": "other",             "label": "Other document", "fills": []}
+  ]
+}

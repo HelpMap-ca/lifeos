@@ -1,0 +1,12 @@
+{
+  "_comment": "Copy to mail.json and fill in with your own mailbox. This file holds identity only — the app password never goes here: store it in the OS keychain with `bin/mapsec set <secret_name>` and name the entry below. mail.json is gitignored.",
+  "imap_host": "imap.your-provider.example",
+  "smtp_host": "smtp.your-provider.example",
+  "login": "you@your-domain.example",
+  "aliases": ["you@your-domain.example", "another@your-domain.example"],
+  "secret_name": "MAIL_APP_PASSWORD",
+  "lanes": {
+    "work": ["@your-domain.example"],
+    "personal": ["you.personal@another-provider.example"]
+  }
+}

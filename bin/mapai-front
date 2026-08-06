@@ -1,0 +1,102 @@
+#!/bin/bash
+# mapai-front — bring up LifeOS and open it in Safari.
+#
+# The real launcher. ~/Desktop/M.command is now a one-line shim that calls this,
+# and so does mapai-onmount, for a reason worth recording: macOS TCC protects
+# ~/Desktop, so a LaunchAgent triggered by the vault mounting gets
+# "Operation not permitted" trying to execute anything that lives there. Code in
+# ~/LifeOS/bin is not protected, so keeping the logic here is what makes the
+# unlock-and-it-opens behaviour work at all.
+#
+# Serves over http://localhost rather than file:// because Ollama returns 403 to
+# a null origin — the whole reason a launcher exists instead of a double-click.
+set -uo pipefail
+
+VAULT="/Volumes/MapAi"
+OLLAMA_APP="/Applications/Ollama.app"
+WEB_PORT="${MAPAI_WEB_PORT:-8765}"
+BRIDGE_PORT=8787
+COMMS_PORT=8788
+COMMS_TOKEN="${M_COMMS_TOKEN:-}"
+COMMS_BIND="${M_COMMS_BIND:-}"
+BIN="$HOME/LifeOS/bin"
+
+echo "· M · LifeOS starting…"
+
+# 1) Vault — everything else is inside it.
+if [ ! -d "$VAULT" ]; then
+  echo "  unlocking the MapAi vault…"
+  "$BIN/mapai" open || {
+    echo "  ✗ could not open the vault. Double-click MapAi on the Desktop and"
+    echo "    enter the password, then try again."; exit 1; }
+fi
+DIR="$VAULT"
+
+# 2) Local models — Ollama
+if ! curl -s --max-time 2 "http://localhost:11434/api/version" >/dev/null 2>&1; then
+  echo "  starting Ollama…"
+  if [ -d "$OLLAMA_APP" ]; then open -a "$OLLAMA_APP"
+  else "$OLLAMA_APP/Contents/Resources/ollama" serve >/tmp/m-ollama.log 2>&1 & fi
+  for i in $(seq 1 15); do
+    curl -s --max-time 2 http://localhost:11434/api/version >/dev/null 2>&1 && break
+    sleep 1
+  done
+fi
+echo "  local models: $(curl -s --max-time 2 http://localhost:11434/api/version 2>/dev/null || echo 'not up')"
+
+# 3) Frontier bridge (uses the Claude subscription, no API key)
+if [ -f "$DIR/m-bridge.py" ] && ! curl -s --max-time 2 "http://localhost:$BRIDGE_PORT/" >/dev/null 2>&1; then
+  echo "  starting frontier bridge…"
+  ( python3 "$DIR/m-bridge.py" >/tmp/m-bridge.log 2>&1 & )
+  sleep 1
+fi
+
+# 4) Peer comms relay — only when a shared token is set
+if [ -f "$DIR/comms.py" ] && [ -n "$COMMS_TOKEN" ]; then
+  if ! curl -s --max-time 2 -H "X-M-Token: $COMMS_TOKEN" "http://localhost:$COMMS_PORT/health" >/dev/null 2>&1; then
+    echo "  starting comms relay…"
+    ( M_COMMS_TOKEN="$COMMS_TOKEN" M_COMMS_BIND="${COMMS_BIND:-127.0.0.1}" M_COMMS_PORT=$COMMS_PORT \
+      python3 "$DIR/comms.py" >/tmp/m-comms.log 2>&1 & )
+    sleep 1
+  fi
+fi
+
+# 5) The web server. mapai-server.py, not `python3 -m http.server`: it also
+#    exposes /api/vault/* so the Vault panel can change the password and icon.
+if ! curl -s --max-time 2 "http://localhost:$WEB_PORT/lifeos.html" >/dev/null 2>&1; then
+  echo "  starting web server on :${WEB_PORT}…"
+  ( MAPAI_WEB_ROOT="$DIR" MAPAI_WEB_PORT="$WEB_PORT" \
+    python3 "$BIN/mapai-server.py" >/tmp/m-web.log 2>&1 & )
+  for i in $(seq 1 20); do
+    curl -s --max-time 1 "http://localhost:$WEB_PORT/lifeos.html" >/dev/null 2>&1 && break
+    sleep 0.5
+  done
+fi
+
+if ! curl -s --max-time 2 "http://localhost:$WEB_PORT/lifeos.html" >/dev/null 2>&1; then
+  echo "  ✗ web server did not come up — see /tmp/m-web.log"
+  exit 1
+fi
+
+# 6) Your own map.ca (:3001) — the REAL site with the LifeOS layer over it.
+#    This is the front door now: map.ca is the experience, LifeOS is the skin.
+if ! curl -s --max-time 2 "http://localhost:3001/" >/dev/null 2>&1; then
+  echo "  starting your map.ca host on :3001…"
+  ( nohup python3 "$BIN/mapca-local" >/tmp/mapca-prod.log 2>&1 & )
+  for i in $(seq 1 10); do
+    curl -s --max-time 1 "http://localhost:3001/" >/dev/null 2>&1 && break
+    sleep 0.5
+  done
+fi
+
+# 7) Open it. Safari specifically, as asked. The real site if it came up;
+#    the LifeOS cockpit stays reachable at :8765 either way.
+if curl -s --max-time 2 "http://localhost:3001/" >/dev/null 2>&1; then
+  URL="http://localhost:3001/"
+else
+  echo "  ✗ :3001 not up (see /tmp/mapca-prod.log) — falling back to the cockpit"
+  URL="http://localhost:$WEB_PORT/lifeos.html"
+fi
+echo "  opening in Safari → ${URL}"
+open -a Safari "${URL}" 2>/dev/null || open "${URL}"
+echo "· Ready."

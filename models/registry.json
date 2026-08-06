@@ -1,0 +1,12 @@
+{
+  "runtime": "ollama",
+  "endpoint": "http://localhost:11434/v1",
+  "rule": "known time budget -> cheapest rung that fits the window; escalate only on failure",
+  "ladder": [
+    { "rung": 1, "name": "llama3.1:8b", "where": "this machine (Ollama)", "cost": "free", "use": "fast classify/extract/route" },
+    { "rung": 2, "name": "qwen2.5:32b", "where": "this machine (Ollama)", "cost": "free", "use": "daily driver, drafting, summaries" },
+    { "rung": 3, "name": "(your GPU box)", "where": "optional local AI backend", "cost": "power only", "use": "batch/overnight jobs, evals" },
+    { "rung": 4, "name": "claude (bridge)", "where": "m-bridge :8787", "cost": "subscription", "use": "frontier reasoning when a local rung fails" }
+  ],
+  "models": []
+}

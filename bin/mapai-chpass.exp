@@ -1,0 +1,34 @@
+#!/usr/bin/expect -f
+# mapai-chpass.exp — change the MapAi vault password.
+#
+#   mapai-chpass.exp <image> <oldpass> <newpass>
+#
+# Why expect and not a pipe: `hdiutil chpass -oldstdinpass -newstdinpass`
+# LOOKS pipeable, but -oldstdinpass consumes the ENTIRE stdin as the old
+# password. -newstdinpass then reads an empty string and hdiutil cheerfully
+# sets a BLANK password, reporting success. That is a silent, total loss of
+# protection — it happened here on 2026-07-31 during development. Driving the
+# real prompts is the only safe way.
+#
+# Note Tcl regex has no (?i); use -nocase.
+set timeout 300
+set img   [lindex $argv 0]
+set oldpw [lindex $argv 1]
+set newpw [lindex $argv 2]
+
+if {$newpw eq ""} { puts "REFUSED: empty new password"; exit 3 }
+
+set failed 0
+spawn hdiutil chpass $img
+expect {
+  -nocase -re "enter password to access" { send -- "$oldpw\r"; exp_continue }
+  -nocase -re "new password"             { send -- "$newpw\r"; exp_continue }
+  -nocase -re "re-enter|verify|again"    { send -- "$newpw\r"; exp_continue }
+  -nocase -re "authentication error"     { set failed 1; exp_continue }
+  -nocase -re "chpass failed"            { set failed 1; exp_continue }
+  timeout                                { puts "TIMEOUT"; exit 2 }
+  eof
+}
+catch wait result
+if {$failed} { exit 1 }
+exit [lindex $result 3]

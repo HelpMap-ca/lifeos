@@ -1,0 +1,353 @@
+#!/usr/bin/env python3
+"""prompts — the LifeOS prompt library: browse cards, launch builds, run fleets.
+
+Every card in ~/LifeOS/vault/projects/prompt-library/ is a self-contained build
+prompt born from the 2026-07-31 end-to-end audit. One card = one build.
+
+  prompts                     list the library (status, priority, title)
+  prompts audit               show the audit report
+  prompts show|copy|path <c>  read a card / copy to clipboard / print path
+  prompts launch <c>          interactive Claude Code session ON that card
+  prompts done|todo|building <c>   set a card's status
+
+FLEET — simultaneous execution (headless Claude Code sessions):
+  prompts run <c> [--model m]      one card, headless, in the background
+  prompts fleet <c> <c> ... [--dry-run] [--max N] [--force] [--model m]
+  prompts fleet P0|P1|P2 [...]     every todo card in that tier
+  prompts ps                       what's running / finished
+  prompts log <c>                  tail the newest log for a card
+
+Cards declare `touches:` (the file domains they edit) — the fleet refuses to
+co-run two cards that share a domain, and skips cards whose `depends:` aren't
+done (override with --force). Parallel sessions draw on the same Claude
+subscription window; default cap is 4 at once.
+
+<c> is a number (3), a slug (install-foundry), or any unique fragment.
+"""
+import glob
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+
+HOME = os.path.expanduser("~")
+LIB = os.environ.get("PROMPTS_LIB") or os.path.join(
+    HOME, "LifeOS", "vault", "projects", "prompt-library")
+RUNS = os.path.join(LIB, "runs")
+STATE = os.path.join(RUNS, "state.json")
+BOLD, DIM, RED, YEL, GRN, CYN, RST = (
+    "\033[1m", "\033[2m", "\033[31m", "\033[33m", "\033[32m", "\033[36m", "\033[0m")
+GLYPH = {"todo": "○", "building": "◐", "done": "●", "repeatable": "↻"}
+PRI_COLOR = {"P0": RED, "P1": YEL, "P2": DIM}
+MAX_PARALLEL = 4
+
+
+def cards():
+    out = []
+    for path in sorted(glob.glob(os.path.join(LIB, "[0-9][0-9]-*.md"))):
+        with open(path) as f:
+            text = f.read()
+        m = re.match(r"---\n(.*?)\n---\n", text, re.S)
+        meta = {}
+        if m:
+            for line in m.group(1).splitlines():
+                if ":" in line:
+                    k, v = line.split(":", 1)
+                    meta[k.strip()] = v.strip()
+        meta["path"], meta["text"] = path, text
+        meta["touches"] = set(re.findall(r"[\w-]+", meta.get("touches", "")))
+        meta["depends"] = re.findall(r"\d+", meta.get("depends", ""))
+        out.append(meta)
+    return out
+
+
+def find(token):
+    token = token.lstrip("#")
+    cs = cards()
+    if token.isdigit():  # exact id: 0, 00, 3, 03 all work
+        for c in cs:
+            if c.get("id", "").isdigit() and int(c["id"]) == int(token):
+                return c
+    hits = [c for c in cs if token.lower() in c.get("slug", "").lower()
+            or token.lower() in c.get("title", "").lower()]
+    if len(hits) == 1:
+        return hits[0]
+    if not hits:
+        sys.exit(f"{RED}no card matches '{token}'{RST} — run `prompts` to list")
+    sys.exit(f"{YEL}'{token}' is ambiguous:{RST} " +
+             ", ".join(f"{c['id']} {c['slug']}" for c in hits))
+
+
+def list_cards():
+    cs = cards()
+    done = sum(1 for c in cs if c.get("status") == "done")
+    total = len([c for c in cs if c.get("status") != "repeatable"])
+    print(f"\n{BOLD}LifeOS prompt library{RST} {DIM}· {LIB}{RST}")
+    print(f"{DIM}audit 2026-07-31 · {done}/{total} built · one: prompts launch <c> · "
+          f"many: prompts fleet <c> <c> …{RST}\n")
+    for c in cs:
+        st = c.get("status", "todo")
+        g = GLYPH.get(st, "?")
+        gcol = GRN if st == "done" else (CYN if st == "building" else "")
+        pri = c.get("priority", "  ")
+        pc = PRI_COLOR.get(pri, "")
+        print(f"  {gcol}{g}{RST} {c.get('id','??')}  {pc}{pri}{RST}  "
+              f"{c.get('title','')[:74]}  {DIM}[{'/'.join(sorted(c['touches']))}]{RST}")
+    print(f"\n  {DIM}○ todo   ◐ building   ● done   ↻ repeatable · "
+          f"[domains] = fleet conflict lanes{RST}\n")
+
+
+def set_status(c, status):
+    new = re.sub(r"(?m)^status: .*$", f"status: {status}", c["text"], count=1)
+    with open(c["path"], "w") as f:
+        f.write(new)
+    print(f"{GRN}✓{RST} {c['id']} {c['slug']} → {status}")
+
+
+def claude_binary():
+    from shutil import which
+    if which("claude"):
+        return which("claude")
+    hits = sorted(glob.glob(os.path.join(
+        HOME, ".vscode", "extensions",
+        "anthropic.claude-code-*", "resources", "native-binary", "claude")))
+    if hits:
+        return hits[-1]
+    sys.exit(f"{RED}claude binary not found{RST} — install Claude Code or add it to PATH")
+
+
+def build_prompt(c, fleet=False):
+    lanes = ", ".join(sorted(c["touches"])) or "unrestricted"
+    fleet_rules = (
+        "\nFLEET RULES — you are ONE OF SEVERAL PARALLEL sessions working this "
+        f"machine right now. Your lanes: [{lanes}]. Only create/edit files inside "
+        "your card's scope; if the build truly requires touching something outside "
+        "your lanes (especially lifeos.html or mapai-server.py when they are not "
+        "yours), do NOT edit it — write what's needed into your card file under "
+        "'## Handoff' and finish the rest. Restarting the :8765 server is allowed "
+        "only if mapai-server is in your lanes.\n" if fleet else "")
+    return (
+        f"You are executing build card {c['id']} ({c['slug']}) from the owner's LifeOS "
+        f"prompt library.\nCard file: {c['path']}\nWork from ~/LifeOS. Verify against "
+        f"the live system before changing anything, follow the card's Build steps, and "
+        f"stop at its Definition of done. When done and verified, run "
+        f"`~/LifeOS/bin/prompts done {c['id']}`.{fleet_rules}\n\n{c['text']}")
+
+
+# ------------------------------------------------------------------ fleet
+def load_state():
+    try:
+        with open(STATE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {"runs": []}
+
+
+def save_state(st):
+    os.makedirs(RUNS, exist_ok=True)
+    with open(STATE, "w") as f:
+        json.dump(st, f, indent=2)
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def running_runs(st):
+    return [r for r in st["runs"] if r.get("status") == "running" and alive(r["pid"])]
+
+
+def spawn(c, model=None, fleet=False):
+    from datetime import datetime
+    os.makedirs(RUNS, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    log = os.path.join(RUNS, f"{c['id']}-{c['slug']}-{ts}.log")
+    prompt = build_prompt(c, fleet=fleet)
+    pfile = log[:-4] + ".prompt"
+    with open(pfile, "w") as f:
+        f.write(prompt)
+    binary = claude_binary()
+    cmd = (f'cd "{HOME}" && "{binary}" -p "$(cat \'{pfile}\')" '
+           f'--permission-mode bypassPermissions --output-format text '
+           + (f'--model "{model}" ' if model else "")
+           + f'< /dev/null >> "{log}" 2>&1; echo "--- fleet: session exited $?" >> "{log}"')
+    p = subprocess.Popen(["/bin/sh", "-c", cmd], start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if c.get("status") == "todo":
+        set_status(c, "building")
+    st = load_state()
+    st["runs"].append({"id": c["id"], "slug": c["slug"], "pid": p.pid, "log": log,
+                       "model": model or "session-default", "started": ts,
+                       "touches": sorted(c["touches"]), "status": "running"})
+    save_state(st)
+    print(f"{CYN}▶{RST} card {c['id']} {c['slug']} — pid {p.pid} {DIM}→ {log}{RST}")
+
+
+def fleet(tokens, dry=False, cap=MAX_PARALLEL, force=False, model=None):
+    cs = cards()
+    by_id = {c["id"]: c for c in cs}
+    # tier selectors (P0/P1/P2) expand to that tier's todo cards
+    picked = []
+    for t in tokens:
+        if t.upper() in ("P0", "P1", "P2"):
+            picked += [c for c in cs if c.get("priority") == t.upper()
+                       and c.get("status") == "todo"]
+        else:
+            picked.append(find(t))
+    # dedupe, keep order
+    seen, sel = set(), []
+    for c in picked:
+        if c["id"] not in seen:
+            seen.add(c["id"])
+            sel.append(c)
+    if not sel:
+        sys.exit("nothing to run")
+    st = load_state()
+    busy_lanes = set()
+    for r in running_runs(st):
+        busy_lanes |= set(r.get("touches", []))
+    plan, skipped, lanes = [], [], set(busy_lanes)
+    for c in sel:
+        if c.get("status") == "done" and not force:
+            skipped.append((c, "already done"))
+            continue
+        undone = [d for d in c["depends"]
+                  if by_id.get(d.zfill(2), {}).get("status") != "done"]
+        if undone and not force:
+            skipped.append((c, f"depends on {'/'.join(undone)} (not done)"))
+            continue
+        clash = c["touches"] & lanes
+        if clash:
+            skipped.append((c, f"lane conflict: {'/'.join(sorted(clash))}"))
+            continue
+        if len(plan) >= cap:
+            skipped.append((c, f"over --max {cap} cap"))
+            continue
+        plan.append(c)
+        lanes |= c["touches"]
+    print(f"\n{BOLD}fleet plan{RST}"
+          + (f" {DIM}(lanes busy from running sessions: {'/'.join(sorted(busy_lanes))}){RST}"
+             if busy_lanes else ""))
+    for c in plan:
+        print(f"  {GRN}▶{RST} {c['id']} {c['slug']}  {DIM}[{'/'.join(sorted(c['touches']))}]{RST}")
+    for c, why in skipped:
+        print(f"  {YEL}∅{RST} {c['id']} {c['slug']}  {DIM}{why}{RST}")
+    if dry:
+        print(f"\n{DIM}dry run — nothing started{RST}")
+        return
+    if not plan:
+        sys.exit(f"\n{RED}nothing runnable{RST} — resolve the skips above")
+    for c in plan:
+        spawn(c, model=model, fleet=True)
+    print(f"\n{len(plan)} session(s) running in parallel. Watch: prompts ps · "
+          f"prompts log <c>\n{DIM}Note: parallel sessions share your Claude "
+          f"subscription window.{RST}")
+
+
+def ps():
+    st = load_state()
+    changed = False
+    if not st["runs"]:
+        print("no fleet runs yet")
+        return
+    for r in st["runs"][-20:]:
+        if r["status"] == "running" and not alive(r["pid"]):
+            r["status"] = "exited"
+            changed = True
+        mark = {"running": f"{CYN}◐ running{RST}",
+                "exited": f"{DIM}■ exited {RST}"}.get(r["status"], r["status"])
+        tail = ""
+        try:
+            with open(r["log"]) as f:
+                lines = [l.strip() for l in f.readlines() if l.strip()]
+            if lines:
+                tail = lines[-1][:70]
+        except OSError:
+            pass
+        print(f"  {mark}  {r['id']} {r['slug']:<22} pid {r['pid']:<7} "
+              f"{DIM}{r['started']} · {tail}{RST}")
+    if changed:
+        save_state(st)
+
+
+def show_log(c):
+    logs = sorted(glob.glob(os.path.join(RUNS, f"{c['id']}-*.log")))
+    if not logs:
+        sys.exit(f"no logs for card {c['id']}")
+    print(f"{DIM}── {logs[-1]} (last 40 lines) ──{RST}")
+    with open(logs[-1]) as f:
+        for line in f.readlines()[-40:]:
+            print(line.rstrip())
+
+
+def launch(c):
+    binary = claude_binary()
+    if c.get("status") == "todo":
+        set_status(c, "building")
+    os.chdir(HOME)
+    print(f"{CYN}launching Claude Code on card {c['id']} — {c.get('title','')}{RST}")
+    os.execv(binary, [binary, build_prompt(c)])
+
+
+def main():
+    args = sys.argv[1:]
+    flags = {a for a in args if a.startswith("--")}
+    args = [a for a in args if not a.startswith("--")]
+    model = None
+    if "--model" in flags:  # crude: --model=NAME form only for flags-with-values
+        pass
+    for a in list(flags):
+        if a.startswith("--model="):
+            model = a.split("=", 1)[1]
+    cap = MAX_PARALLEL
+    for a in list(flags):
+        if a.startswith("--max="):
+            cap = int(a.split("=", 1)[1])
+    if not args or args[0] in ("list", "ls"):
+        return list_cards()
+    cmd = args[0]
+    if cmd == "audit":
+        with open(os.path.join(LIB, "AUDIT.md")) as f:
+            print(f.read())
+        return
+    if cmd in ("-h", "--help", "help"):
+        print(__doc__)
+        return
+    if cmd == "ps":
+        return ps()
+    if cmd == "fleet":
+        if len(args) < 2:
+            sys.exit("usage: prompts fleet <card|P0|P1|P2> ... [--dry-run] [--max=N] [--force] [--model=m]")
+        return fleet(args[1:], dry="--dry-run" in flags, cap=cap,
+                     force="--force" in flags, model=model)
+    if len(args) < 2:
+        sys.exit(f"usage: prompts {cmd} <card>   (run `prompts` to list)")
+    c = find(args[1])
+    if cmd == "show":
+        print(c["text"])
+    elif cmd == "path":
+        print(c["path"])
+    elif cmd == "copy":
+        subprocess.run("pbcopy", input=c["text"], text=True)
+        print(f"{GRN}✓{RST} card {c['id']} copied to clipboard")
+    elif cmd == "launch":
+        launch(c)
+    elif cmd == "run":
+        spawn(c, model=model, fleet=True)
+        print("watch: prompts ps · prompts log " + c["id"])
+    elif cmd == "log":
+        show_log(c)
+    elif cmd in ("done", "todo", "building"):
+        set_status(c, cmd)
+    else:
+        sys.exit(f"unknown command '{cmd}' — try `prompts help`")
+
+
+if __name__ == "__main__":
+    main()

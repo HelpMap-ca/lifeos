@@ -1,0 +1,7 @@
+{
+  "_comment": "Copy to mapca.json and fill in. These values are PUBLIC by design: the anon key is the same one shipped in every visitor's browser bundle, and it reads only already-published pins through the same guarded doors the website uses. LifeOS holds nothing else — no session token, no service key. Delete mapca.json to go back to pure offline.",
+  "contract": 1,
+  "base_url": "https://<your-project>.supabase.co",
+  "anon_key": "<the public anon key>",
+  "handle": "<your map.ca handle, without the @>"
+}

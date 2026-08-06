@@ -1,0 +1,22 @@
+#!/bin/bash
+# mapsec — wrapper.
+#
+# The real mapsec lives inside the encrypted vault, next to the manifest it
+# reads. That is the right home for it, but it means the command vanishes
+# whenever the vault is locked. This wrapper closes that gap: it opens the
+# vault (password from the Keychain, no prompt) and hands off.
+#
+# Keeps `mapsec` working from any shell, locked or not.
+set -e
+VAULT="/Volumes/MapAi"
+REAL="$VAULT/mapsec"
+
+if [ ! -d "$VAULT" ]; then
+  "$HOME/LifeOS/bin/mapai" open >/dev/null 2>&1 || {
+    echo "mapsec: the MapAi vault is locked and could not be opened." >&2
+    echo "  Double-click MapAi on the Desktop, enter the password, then retry." >&2
+    exit 3; }
+fi
+
+[ -x "$REAL" ] || { echo "mapsec: not found at $REAL" >&2; exit 2; }
+exec python3 "$REAL" "$@"

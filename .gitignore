@@ -9,3 +9,9 @@ node_modules/
 .venv/
 *.db
 *.log
+
+# Member data generated at runtime (zone Z1) — never commit someone's own
+# pins, their backup generation, or their sync log.
+profile/pins.json
+profile/pins.json.bak
+profile/sync-log.jsonl

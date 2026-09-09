@@ -44,7 +44,7 @@ _Rung 0 = no model needed (plain script). Rungs 1–4 per `models/registry.json`
 
 ## Build loop (the demo that goes public)
 
-1. **Spec** — generate candidate specs per category (OpenAI credits, prompts in `openai-prompts.md`)
+1. **Spec** — generate candidate specs per category (local model, per `models/registry.json`)
 2. **Rank** — value × feasibility on a small local model; pick the essential five
 3. **Build** — rung 1–2 does the drafting; frontier (rung 4) reviews
 4. **Verify** — run the tool's `verify:` block against each listed LLM on the DGX; record pass/fail per model
